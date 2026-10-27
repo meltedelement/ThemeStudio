@@ -1,0 +1,305 @@
+#!/usr/bin/env bash
+# /* ---- 💫 theme-apply 💫 ---- */
+# Applies a theme bundle: wallpaper + colour palette + Waybar style + Kitty theme
+# + Rofi style + GTK/icon/cursor themes, as defined in a ~/.config/hypr/themes/*.theme file.
+#
+# Usage: theme-apply <path/to/file.theme | theme filename without .theme>
+#
+# Bundle file format (all fields optional, blank = leave that piece untouched):
+#   NAME="Display Name"
+#   WALLPAPER="/absolute/path/to/image"
+#   COLOR_SOURCE="wallpaper|preset|custom|none"  # inferred from the fields below when missing
+#   WALLUST_THEME="ExactWallustThemeName"        # from `wallust theme list`
+#   CUSTOM_COLORS="#bg #fg #cursor #c0 ... #c15" # 19 hex colours, space separated
+#   COLOR_HUES / COLOR_TINT / COLOR_VIBRANCY / COLOR_BRIGHTNESS / COLOR_CONTRAST / COLOR_OVERRIDES
+#                                                # colour adjustments, see themestudio/colors.py
+#   WAYBAR_STYLE="Exact Style Filename.css"      # from ~/.config/waybar/style/
+#   KITTY_THEME="ExactKittyThemeBasename"        # from ~/.config/kitty/kitty-themes/ (no .conf)
+#   ROFI_THEME="Style.rasi"                      # from ~/.config/rofi/themes/
+#   GTK_THEME="Theme-Name"                       # gsettings gtk-theme
+#   ICON_THEME="Icon-Theme"                      # gsettings icon-theme
+#   CURSOR_THEME="Cursor-Theme"                  # gsettings cursor-theme + hyprcursor
+#   COLOR_SCHEME="prefer-dark|prefer-light|default"
+
+set -euo pipefail
+
+THEMES_DIR="$HOME/.config/hypr/themes"
+SCRIPTSDIR="$HOME/.config/hypr/scripts"
+KITTY_THEMES_DIR="$HOME/.config/kitty/kitty-themes"
+KITTY_CONFIG="$HOME/.config/kitty/kitty.conf"
+WAYBAR_STYLES_DIR="$HOME/.config/waybar/style"
+WAYBAR_STYLE_LINK="$HOME/.config/waybar/style.css"
+ROFI_THEMES_DIR="$HOME/.config/rofi/themes"
+ROFI_CONFIG="$HOME/.config/rofi/config.rasi"
+STARTUP_CONF="$HOME/.config/hypr/UserConfigs/Startup_Apps.conf"
+ENV_CONF="$HOME/.config/hypr/UserConfigs/ENVariables.conf"
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/themestudio"
+STUDIO_DIR="$(dirname "$(dirname "$(realpath "$0")")")"
+
+have_notify() { command -v notify-send >/dev/null 2>&1; }
+notify() { have_notify && notify-send -a ThemeStudio -h string:x-dunst-stack-tag:themebundle "$1" "$2" || true; }
+
+bundle_file="${1:-}"
+if [[ -z "$bundle_file" ]]; then
+  echo "usage: theme-apply <file.theme | name>" >&2
+  exit 2
+fi
+if [[ ! -f "$bundle_file" && -f "$THEMES_DIR/$bundle_file.theme" ]]; then
+  bundle_file="$THEMES_DIR/$bundle_file.theme"
+fi
+if [[ ! -f "$bundle_file" ]]; then
+  notify "Theme bundle error" "Could not find bundle: $1"
+  exit 1
+fi
+
+NAME=""
+WALLPAPER=""
+COLOR_SOURCE=""
+WALLUST_THEME=""
+CUSTOM_COLORS=""
+WAYBAR_STYLE=""
+KITTY_THEME=""
+ROFI_THEME=""
+GTK_THEME=""
+ICON_THEME=""
+CURSOR_THEME=""
+COLOR_SCHEME=""
+# shellcheck disable=SC1090
+source "$bundle_file"
+[[ -n "$NAME" ]] || NAME="$(basename "$bundle_file" .theme)"
+
+if [[ -z "$COLOR_SOURCE" ]]; then
+  if [[ -n "$CUSTOM_COLORS" ]]; then COLOR_SOURCE=custom
+  elif [[ -n "$WALLUST_THEME" ]]; then COLOR_SOURCE=preset
+  elif [[ -n "$WALLPAPER" ]]; then COLOR_SOURCE=wallpaper
+  else COLOR_SOURCE=none
+  fi
+fi
+
+start_ts=$(date +%s)
+
+# --- Wallpaper ---
+if [[ -n "$WALLPAPER" ]]; then
+  if [[ -f "$WALLPAPER" ]] && command -v swww >/dev/null 2>&1; then
+    focused_monitor=""
+    if command -v jq >/dev/null 2>&1; then
+      focused_monitor=$(hyprctl monitors -j 2>/dev/null | jq -r '.[] | select(.focused) | .name' 2>/dev/null)
+    fi
+    pkill mpvpaper >/dev/null 2>&1 || true
+    pkill swaybg >/dev/null 2>&1 || true
+    pgrep -x swww-daemon >/dev/null 2>&1 || { swww-daemon --format xrgb >/dev/null 2>&1 & disown; sleep 0.3; }
+
+    SWWW_PARAMS=(--transition-fps 60 --transition-type any --transition-duration 2 --transition-bezier .43,1.19,1,.4)
+    if [[ -n "$focused_monitor" ]]; then
+      swww img -o "$focused_monitor" "$WALLPAPER" "${SWWW_PARAMS[@]}" >/dev/null 2>&1 || true
+    else
+      swww img "$WALLPAPER" "${SWWW_PARAMS[@]}" >/dev/null 2>&1 || true
+    fi
+
+    ln -sf "$WALLPAPER" "$HOME/.config/rofi/.current_wallpaper" 2>/dev/null || true
+    mkdir -p "$HOME/.config/hypr/wallpaper_effects"
+    cp -f "$WALLPAPER" "$HOME/.config/hypr/wallpaper_effects/.wallpaper_current" 2>/dev/null || true
+
+    # Persist across reboots: rewrite the swww-daemon startup line to also set this wallpaper
+    if [[ -f "$STARTUP_CONF" ]]; then
+      escaped_wallpaper=$(printf '%s' "$WALLPAPER" | sed -e 's/[\/&|]/\\&/g')
+      sed -i -E "s|^exec-once = swww-daemon --format xrgb.*$|exec-once = swww-daemon --format xrgb \&\& swww img \"${escaped_wallpaper}\"|" "$STARTUP_CONF"
+    fi
+  else
+    notify "Theme bundle warning" "Wallpaper not found or swww missing: $WALLPAPER"
+  fi
+fi
+
+# --- Colour palette (wallust) ---
+# The theme's palette (preset, custom colours or generated from the wallpaper) is worked out by
+# themestudio/colors.py with the theme's colour adjustments applied, then wallust renders every
+# template from it. If that fails, fall back to applying the source directly, unadjusted.
+wallust_ran=0
+if [[ "$COLOR_SOURCE" != none ]]; then
+  wallust_ok=1
+  mkdir -p "$CACHE_DIR"
+  cs_file="$CACHE_DIR/colorscheme-$(basename "$bundle_file" .theme).json"
+  # Wallpaper themes have always skipped terminal escape sequences; keep that
+  cs_flags=()
+  [[ "$COLOR_SOURCE" == wallpaper ]] && cs_flags=(-s)
+  if ! command -v wallust >/dev/null 2>&1; then
+    wallust_ok=0
+  elif PYTHONPATH="$STUDIO_DIR" python3 -m themestudio.colors "$bundle_file" "$cs_file"; then
+    wallust cs -f pywal "$cs_file" "${cs_flags[@]}" || wallust_ok=0
+  else
+    notify "Theme bundle warning" "Colour adjustments failed; applying unadjusted colours"
+    case "$COLOR_SOURCE" in
+      preset)
+        [[ -n "$WALLUST_THEME" ]] && { wallust theme -- "$WALLUST_THEME" || wallust_ok=0; } || wallust_ok=0
+        ;;
+      custom)
+        read -r -a cc <<<"$CUSTOM_COLORS"
+        if (( ${#cc[@]} == 19 )); then
+          {
+            printf '{"special":{"background":"%s","foreground":"%s","cursor":"%s"},"colors":{' "${cc[0]}" "${cc[1]}" "${cc[2]}"
+            for i in $(seq 0 15); do
+              printf '"color%d":"%s"' "$i" "${cc[$((i + 3))]}"
+              if (( i < 15 )); then printf ','; fi
+            done
+            printf '}}\n'
+          } >"$cs_file"
+          wallust cs -f pywal "$cs_file" || wallust_ok=0
+        else
+          wallust_ok=0
+        fi
+        ;;
+      wallpaper)
+        if [[ -n "$WALLPAPER" && -f "$WALLPAPER" ]]; then
+          wallust run "$WALLPAPER" -s || wallust_ok=0
+        else
+          wallust_ok=0
+        fi
+        ;;
+    esac
+  fi
+
+  if [[ $wallust_ok -eq 1 ]]; then
+    wallust_ran=1
+    mkdir -p "$HOME/.config/ghostty" || true
+
+    targets=(
+      "$HOME/.config/waybar/wallust/colors-waybar.css"
+      "$HOME/.config/rofi/wallust/colors-rofi.rasi"
+      "$HOME/.config/kitty/kitty-themes/01-Wallust.conf"
+      "$HOME/.config/hypr/wallust/wallust-hyprland.conf"
+      "$HOME/.config/ghostty/wallust.conf"
+    )
+
+    ghostty_conf="$HOME/.config/ghostty/wallust.conf"
+    if [ -f "$ghostty_conf" ]; then
+      sed -i -E 's/^(\s*palette\s*=\s*)([0-9]{1,2}):/\1\2=/' "$ghostty_conf" 2>/dev/null || true
+    fi
+
+    # Wait (up to ~2s) for the wallust templates to land
+    for _ in $(seq 1 20); do
+      ok=1
+      for f in "${targets[@]}"; do
+        [ -s "$f" ] || { ok=0; break; }
+        mtime=$(stat -c %Y "$f" 2>/dev/null || echo 0)
+        [ "$mtime" -ge "$start_ts" ] || { ok=0; break; }
+      done
+      [ $ok -eq 1 ] && break
+      sleep 0.1
+    done
+
+    rofi_colors="$HOME/.config/rofi/wallust/colors-rofi.rasi"
+    if [ -f "$rofi_colors" ]; then
+      accent_hex=$(sed -n 's/^\s*color12:\s*\(#[0-9A-Fa-f]\{6\}\).*/\1/p' "$rofi_colors" | head -n1)
+      [ -z "$accent_hex" ] && accent_hex=$(sed -n 's/^\s*color13:\s*\(#[0-9A-Fa-f]\{6\}\).*/\1/p' "$rofi_colors" | head -n1)
+      if [ -n "$accent_hex" ]; then
+        sed -i -E "s|^(\s*selected-normal-background:\s*).*$|\1$accent_hex;|" "$rofi_colors"
+        sed -i -E "s|^(\s*selected-active-background:\s*).*$|\1$accent_hex;|" "$rofi_colors"
+        sed -i -E "s|^(\s*selected-urgent-background:\s*).*$|\1$accent_hex;|" "$rofi_colors"
+        sed -i -E "s|^(\s*selected-normal-foreground:\s*).*$|\1#000000;|" "$rofi_colors"
+        sed -i -E "s|^(\s*selected-active-foreground:\s*).*$|\1#000000;|" "$rofi_colors"
+        sed -i -E "s|^(\s*selected-urgent-foreground:\s*).*$|\1#000000;|" "$rofi_colors"
+      fi
+    fi
+  else
+    notify "Theme bundle warning" "Failed to apply $COLOR_SOURCE colours for $NAME"
+  fi
+fi
+
+# --- Waybar style ---
+if [[ -n "$WAYBAR_STYLE" ]]; then
+  if [[ -f "$WAYBAR_STYLES_DIR/$WAYBAR_STYLE" ]]; then
+    ln -sf "$WAYBAR_STYLES_DIR/$WAYBAR_STYLE" "$WAYBAR_STYLE_LINK"
+  else
+    notify "Theme bundle warning" "Waybar style not found: $WAYBAR_STYLE"
+  fi
+fi
+
+# --- Kitty theme ---
+# Blank KITTY_THEME follows whatever palette wallust just applied (01-Wallust)
+kitty_target=""
+if [[ -n "$KITTY_THEME" ]]; then
+  if [[ -f "$KITTY_THEMES_DIR/$KITTY_THEME.conf" ]]; then
+    kitty_target="$KITTY_THEME"
+  else
+    notify "Theme bundle warning" "Kitty theme not found: $KITTY_THEME"
+  fi
+elif [[ $wallust_ran -eq 1 && -f "$KITTY_THEMES_DIR/01-Wallust.conf" ]]; then
+  kitty_target="01-Wallust"
+fi
+
+if [[ -n "$kitty_target" ]]; then
+  temp_kitty_config_file=$(mktemp)
+  cp "$KITTY_CONFIG" "$temp_kitty_config_file"
+  if grep -q -E '^[#[:space:]]*include\s+\./kitty-themes/.*\.conf' "$temp_kitty_config_file"; then
+    sed -i -E "s|^([#[:space:]]*include\s+\./kitty-themes/).*\.conf|include ./kitty-themes/${kitty_target}.conf|g" "$temp_kitty_config_file"
+  else
+    if [ -s "$temp_kitty_config_file" ] && [ "$(tail -c1 "$temp_kitty_config_file")" != "" ]; then
+      echo >>"$temp_kitty_config_file"
+    fi
+    echo "include ./kitty-themes/${kitty_target}.conf" >>"$temp_kitty_config_file"
+  fi
+  # `kitten themes` appends its own include block, which would override ours
+  sed -i '/^# BEGIN_KITTY_THEME/,/^# END_KITTY_THEME/d' "$temp_kitty_config_file"
+  cp "$temp_kitty_config_file" "$KITTY_CONFIG"
+  rm "$temp_kitty_config_file"
+fi
+
+# --- Rofi style ---
+if [[ -n "$ROFI_THEME" ]]; then
+  if [[ -f "$ROFI_THEMES_DIR/$ROFI_THEME" && -f "$ROFI_CONFIG" ]]; then
+    rofi_line="@theme \"~/.config/rofi/themes/$ROFI_THEME\""
+    escaped_rofi_line=$(printf '%s' "$rofi_line" | sed -e 's/[\/&|]/\\&/g')
+    if grep -qE '^\s*@theme' "$ROFI_CONFIG"; then
+      sed -i -E "s|^\s*@theme.*$|${escaped_rofi_line}|" "$ROFI_CONFIG"
+    else
+      echo "$rofi_line" >>"$ROFI_CONFIG"
+    fi
+  else
+    notify "Theme bundle warning" "Rofi style not found: $ROFI_THEME"
+  fi
+fi
+
+# --- GTK / icons / cursor / light-dark preference ---
+if command -v gsettings >/dev/null 2>&1; then
+  iface=org.gnome.desktop.interface
+  [[ -n "$GTK_THEME" ]] && gsettings set $iface gtk-theme "$GTK_THEME"
+  [[ -n "$ICON_THEME" ]] && gsettings set $iface icon-theme "$ICON_THEME"
+  [[ -n "$COLOR_SCHEME" ]] && gsettings set $iface color-scheme "$COLOR_SCHEME"
+  if [[ -n "$CURSOR_THEME" ]]; then
+    gsettings set $iface cursor-theme "$CURSOR_THEME"
+    cursor_size=$(gsettings get $iface cursor-size 2>/dev/null || echo 24)
+    hyprctl setcursor "$CURSOR_THEME" "$cursor_size" >/dev/null 2>&1 || true
+    # Persist for hyprcursor across restarts
+    if [[ -f "$ENV_CONF" ]]; then
+      sed -i -E "s|^(env\s*=\s*HYPRCURSOR_THEME\s*,).*$|\1${CURSOR_THEME}|; s|^(env\s*=\s*XCURSOR_THEME\s*,).*$|\1${CURSOR_THEME}|" "$ENV_CONF"
+    fi
+  fi
+fi
+
+# --- Reload everything ---
+if command -v hyprctl >/dev/null 2>&1; then
+  hyprctl reload >/dev/null 2>&1 || true
+fi
+
+if [ -x "$SCRIPTSDIR/Refresh.sh" ]; then
+  "$SCRIPTSDIR/Refresh.sh" >/dev/null 2>&1 || true
+else
+  if command -v waybar-msg >/dev/null 2>&1; then
+    waybar-msg cmd reload >/dev/null 2>&1 || true
+  else
+    pkill -SIGUSR2 waybar >/dev/null 2>&1 || true
+  fi
+fi
+
+if pidof kitty >/dev/null 2>&1; then
+  for pid in $(pidof kitty); do kill -SIGUSR1 "$pid" 2>/dev/null || true; done
+fi
+
+if pidof ghostty >/dev/null 2>&1; then
+  for pid in $(pidof ghostty); do kill -SIGUSR2 "$pid" 2>/dev/null || true; done
+fi
+
+mkdir -p "$CACHE_DIR"
+basename "$bundle_file" .theme >"$CACHE_DIR/current"
+
+notify "Theme applied" "$NAME"
